@@ -27,7 +27,7 @@ jobs:
       - name: Toolchain
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl build-essential pkg-config libssl-dev ca-certificates git >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl build-essential pkg-config ca-certificates git >/dev/null
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
