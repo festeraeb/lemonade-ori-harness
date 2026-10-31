@@ -44,9 +44,14 @@ pub struct RunRequest {
     pub skills: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// "lemonade" (local, default) or "gateway" (warp gateway: fleet seats and hosted fallbacks).
+    /// "lemonade" (local, default), "gateway" (warp gateway: fleet seats and hosted fallbacks),
+    /// "nim" (the NIM pool), "cline" (Cline free models), "openrouter" (its free router), or
+    /// "auto" (ask model-chooser for the best free model for `kinds`).
     #[serde(default)]
     pub upstream: Option<String>,
+    /// For upstream "auto": what the task needs, e.g. ["code", "tools"] (default ["chat"]).
+    #[serde(default)]
+    pub kinds: Vec<String>,
     #[serde(default)]
     pub max_steps: Option<u8>,
     /// False: run and return the answer without posting it.
@@ -71,6 +76,12 @@ pub struct Config {
     pub action_models: Vec<String>,
     /// Max concurrent swarm subagents (operator-tunable; the harness hard-caps at 5).
     pub max_agents: usize,
+    /// Cline's OpenAI-compatible API base (key: CLINE_API_KEY).
+    pub cline_url: String,
+    /// OpenRouter's API base (key: OPENROUTER_API_KEY).
+    pub openrouter_url: String,
+    /// model-chooser HTTP base for upstream "auto"; empty = off.
+    pub chooser_url: String,
     /// Shared by every swarm fan-out on this harness, so `max_agents` holds across runs.
     pub agents_sem: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -249,16 +260,81 @@ fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
+/// A chat endpoint and the environment variable holding its key (empty: no key).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint {
+    pub url: String,
+    pub key_env: String,
+}
+
+impl Endpoint {
+    fn open(url: &str) -> Endpoint {
+        Endpoint { url: url.to_string(), key_env: String::new() }
+    }
+
+    /// The key from the environment; an error when the lane needs one and it is unset.
+    pub fn key(&self) -> Result<Option<String>, String> {
+        if self.key_env.is_empty() {
+            return Ok(None);
+        }
+        match std::env::var(&self.key_env) {
+            Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
+            _ => Err(format!("{} needs {} set in Ori's environment", self.url, self.key_env)),
+        }
+    }
+}
+
 /// The chat endpoint for one step of a run. "nim" rotates across the NIM pool (up to 5
 /// endpoints) per step, so one run spreads its calls over the pool.
-pub fn resolve_upstream(key: &str, cfg: &Config, step: usize) -> Result<String, String> {
+pub fn resolve_upstream(key: &str, cfg: &Config, step: usize) -> Result<Endpoint, String> {
     match key {
-        "lemonade" => Ok(cfg.lemonade.clone()),
-        "gateway" => Ok(cfg.gateway.clone()),
+        "lemonade" => Ok(Endpoint::open(&cfg.lemonade)),
+        "gateway" => Ok(Endpoint::open(&cfg.gateway)),
         "nim" if cfg.nim_urls.is_empty() => Err("upstream \"nim\": no NIM endpoint configured (--nim-url)".into()),
-        "nim" => Ok(cfg.nim_urls[step % cfg.nim_urls.len()].clone()),
-        other => Err(format!("upstream {other:?}: use \"lemonade\", \"gateway\" or \"nim\"")),
+        "nim" => Ok(Endpoint::open(&cfg.nim_urls[step % cfg.nim_urls.len()])),
+        "cline" => Ok(Endpoint { url: cfg.cline_url.clone(), key_env: "CLINE_API_KEY".into() }),
+        "openrouter" => Ok(Endpoint { url: cfg.openrouter_url.clone(), key_env: "OPENROUTER_API_KEY".into() }),
+        other => Err(format!(
+            "upstream {other:?}: use \"lemonade\", \"gateway\", \"nim\", \"cline\", \"openrouter\" or \"auto\""
+        )),
     }
+}
+
+/// Ask model-chooser for the best free model for `kinds`: (endpoint, model id).
+async fn choose_model(client: &reqwest::Client, cfg: &Config, kinds: &[String]) -> Result<(Endpoint, String), String> {
+    if cfg.chooser_url.is_empty() {
+        return Err("upstream \"auto\" needs --chooser-url (model-chooser serve)".into());
+    }
+    let kinds = if kinds.is_empty() { "chat".to_string() } else { kinds.join(",") };
+    let url = format!("{}/choose?n=1&kinds={}", cfg.chooser_url.trim_end_matches('/'), kinds);
+    let v: Value = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("model-chooser: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("model-chooser: {e}"))?;
+    if let Some(e) = v["error"].as_str() {
+        return Err(format!("model-chooser: {e}"));
+    }
+    let pick = &v["picks"][0];
+    let (Some(base), Some(model)) = (pick["base_url"].as_str(), pick["model"].as_str()) else {
+        return Err(format!("model-chooser: no model fits {kinds}"));
+    };
+    Ok((Endpoint { url: base.to_string(), key_env: pick["key_env"].as_str().unwrap_or("").to_string() }, model.to_string()))
+}
+
+/// Tell model-chooser how its pick did, so later choices learn from it. Best effort.
+async fn report_outcome(client: &reqwest::Client, cfg: &Config, model: &str, kind: &str, ok: bool) {
+    let url = format!("{}/outcome", cfg.chooser_url.trim_end_matches('/'));
+    let _ = client
+        .post(&url)
+        .json(&json!({"model": model, "kind": kind, "ok": ok}))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
 }
 
 pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Result<Value, String> {
@@ -267,9 +343,19 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
         return Err("goal and room are required".into());
     }
     let upstream_key = req.upstream.as_deref().unwrap_or("lemonade").to_string();
-    // Validate the upstream once; "nim" rotates across the pool per step inside the loop.
-    resolve_upstream(&upstream_key, cfg, 0)?;
-    let model = req.model.clone().unwrap_or_else(|| cfg.default_model.clone());
+    // "auto" fixes one chosen endpoint and model for the run; others are checked once here and
+    // "nim" rotates across the pool per step inside the loop.
+    let chosen = if upstream_key == "auto" {
+        Some(choose_model(client, cfg, &req.kinds).await?)
+    } else {
+        resolve_upstream(&upstream_key, cfg, 0)?.key()?;
+        None
+    };
+    let model = match (&req.model, &chosen) {
+        (Some(m), _) => m.clone(),
+        (None, Some((_, m))) => m.clone(),
+        (None, None) => cfg.default_model.clone(),
+    };
     // Ori decides the tier from the model, not the caller: a small model asked for action gets research.
     let wants_action = req.tier.as_deref() == Some("action");
     let tier = if wants_action && crate::policy::action_allowed(&model, &cfg.action_models) { Tier::Action } else { Tier::Agent };
@@ -311,12 +397,16 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
         // Reasoning models spend tokens thinking before they answer, so leave them room.
         let max_tokens = if tier == Tier::Action { 2500 } else { 900 };
         // Resolve the backend per step: "nim" rotates across the up-to-5 NIM pool.
-        let base = resolve_upstream(&upstream_key, cfg, step as usize)?;
-        let reply = match llm::chat(client, &base, &model, &messages, max_tokens, 0.2).await {
+        let ep = match &chosen {
+            Some((ep, _)) => ep.clone(),
+            None => resolve_upstream(&upstream_key, cfg, step as usize)?,
+        };
+        let key = ep.key()?;
+        let reply = match llm::chat_keyed(client, &ep.url, key.as_deref(), &model, &messages, max_tokens, 0.2).await {
             Ok(r) => r,
             Err(first) => {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                match llm::chat(client, &base, &model, &messages, max_tokens, 0.2).await {
+                match llm::chat_keyed(client, &ep.url, key.as_deref(), &model, &messages, max_tokens, 0.2).await {
                     Ok(r) => r,
                     Err(e) => {
                         trace.push(json!({"step": step, "llm_error": e, "first_error": first}));
@@ -423,6 +513,11 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
         }
     }
 
+    if chosen.is_some() {
+        let kind = req.kinds.first().map(String::as_str).unwrap_or("chat");
+        report_outcome(client, cfg, &model, kind, answer.is_some()).await;
+    }
+
     let record = json!({
         "run_id": run_id, "agent": req.agent, "room": req.room, "goal": req.goal, "trigger_id": req.trigger_id,
         "model": model, "upstream": req.upstream.as_deref().unwrap_or("lemonade"), "tier": tier_name,
@@ -472,6 +567,9 @@ mod upstream_tests {
             default_model: "m".into(),
             action_models: vec![],
             max_agents: 3,
+            cline_url: "C".into(),
+            openrouter_url: "O".into(),
+            chooser_url: String::new(),
             agents_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(3)),
         }
     }
@@ -479,11 +577,23 @@ mod upstream_tests {
     #[test]
     fn nim_rotates_per_step_and_needs_a_pool() {
         let c = cfg(&["n1", "n2"]);
-        assert_eq!(resolve_upstream("nim", &c, 0).unwrap(), "n1");
-        assert_eq!(resolve_upstream("nim", &c, 1).unwrap(), "n2");
-        assert_eq!(resolve_upstream("nim", &c, 2).unwrap(), "n1");
-        assert_eq!(resolve_upstream("lemonade", &c, 5).unwrap(), "L");
+        let url = |k: &str, step| resolve_upstream(k, &c, step).unwrap().url;
+        assert_eq!(url("nim", 0), "n1");
+        assert_eq!(url("nim", 1), "n2");
+        assert_eq!(url("nim", 2), "n1");
+        assert_eq!(url("lemonade", 5), "L");
         assert!(resolve_upstream("nim", &cfg(&[]), 0).is_err());
-        assert!(resolve_upstream("openrouter", &c, 0).is_err());
+        assert!(resolve_upstream("bogus", &c, 0).is_err());
+    }
+
+    #[test]
+    fn hosted_lanes_carry_their_key_name() {
+        let c = cfg(&[]);
+        let or = resolve_upstream("openrouter", &c, 0).unwrap();
+        assert_eq!((or.url.as_str(), or.key_env.as_str()), ("O", "OPENROUTER_API_KEY"));
+        assert_eq!(resolve_upstream("cline", &c, 0).unwrap().key_env, "CLINE_API_KEY");
+        assert_eq!(resolve_upstream("lemonade", &c, 0).unwrap().key().unwrap(), None);
+        let missing = Endpoint { url: "x".into(), key_env: "ORI_TEST_KEY_THAT_IS_NOT_SET".into() };
+        assert!(missing.key().is_err());
     }
 }

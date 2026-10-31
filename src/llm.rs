@@ -44,6 +44,19 @@ pub async fn chat(
     max_tokens: u32,
     temperature: f32,
 ) -> Result<String, String> {
+    chat_keyed(client, base, None, model, messages, max_tokens, temperature).await
+}
+
+/// `chat` with an optional bearer key, for hosted lanes (Cline, OpenRouter).
+pub async fn chat_keyed(
+    client: &reqwest::Client,
+    base: &str,
+    key: Option<&str>,
+    model: &str,
+    messages: &[Value],
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
     let body = json!({
         "model": model,
@@ -52,8 +65,11 @@ pub async fn chat(
         "temperature": temperature,
         "stream": false,
     });
-    let resp = client
-        .post(&url)
+    let mut req = client.post(&url);
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req
         .json(&body)
         .timeout(std::time::Duration::from_secs(300))
         .send()

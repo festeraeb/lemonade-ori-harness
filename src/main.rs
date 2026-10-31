@@ -59,6 +59,18 @@ struct Args {
         help = "OpenAI-compatible NVIDIA NIM endpoints (or local proxies that add the API key), comma-separated, at most 5; upstream \"nim\" and spawn_subagents use them in turn")]
     nim_url: String,
 
+    #[arg(long, default_value = "https://api.cline.bot/api", env = "ORI_CLINE_URL",
+        help = "Cline's OpenAI-compatible API for upstream \"cline\" (key: CLINE_API_KEY)")]
+    cline_url: String,
+
+    #[arg(long, default_value = "https://openrouter.ai/api", env = "ORI_OPENROUTER_URL",
+        help = "OpenRouter's API for upstream \"openrouter\" (key: OPENROUTER_API_KEY)")]
+    openrouter_url: String,
+
+    #[arg(long, default_value = "", env = "ORI_CHOOSER_URL",
+        help = "model-chooser (`model-chooser serve`, e.g. http://127.0.0.1:9147) for upstream \"auto\"; empty = off")]
+    chooser_url: String,
+
     #[arg(long, default_value_t = 3, env = "ORI_MAX_AGENTS",
         help = "Subagents at once across the harness (ask_helper per run, spawn_subagents); capped at 5")]
     max_agents: usize,
@@ -136,6 +148,9 @@ impl AppState {
             default_model: self.args.agent_model.clone(),
             action_models: self.args.action_models.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             max_agents: max_agents(self.args.max_agents),
+            cline_url: self.args.cline_url.clone(),
+            openrouter_url: self.args.openrouter_url.clone(),
+            chooser_url: self.args.chooser_url.clone(),
             agents_sem: self.agents.clone(),
         }
     }

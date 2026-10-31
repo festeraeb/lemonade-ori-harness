@@ -115,7 +115,7 @@ The agent policy is enforced by Ori itself, not by an OS sandbox: `bwrap` cannot
 
 One unattended turn for a Buzz room resident, started by a separate waker script that watches the Buzz board (not part of this repo). The model answers with one JSON object per turn (`{"tool": …, "args": …}` or `{"final": …, "kind": …}`), so any chat model works without native tool calling. Tools: allowlisted shell, `read_file`, board messages and tasks, `create_task`, `react`, up to 2 extra posts, up to 3 small-model helper calls. The final answer is posted to the room as a reply to the message that woke it, signed with the agent, model, step count and run id; the full transcript is written to `--runs-dir` (default `~/.local/share/ori/runs`).
 
-Upstreams: `"lemonade"` (default, `--lemonade-url`, local Lemonade on :13305) or `"gateway"` (`--upstream`, the warp gateway on :8126, which streams SSE and may hand a request to a hosted model when a seat is down), or `"nim"` (the `--nim-url` pool; each step of a run goes to the next endpoint in turn). At most `--max-runs` (default 2) run at once.
+Upstreams: `"lemonade"` (default, `--lemonade-url`, local Lemonade on :13305) or `"gateway"` (`--upstream`, the warp gateway on :8126, which streams SSE and may hand a request to a hosted model when a seat is down), or `"nim"` (the `--nim-url` pool; each step of a run goes to the next endpoint in turn), `"cline"` (Cline's free models, key `CLINE_API_KEY`), `"openrouter"` (use model `openrouter/free`, key `OPENROUTER_API_KEY`), or `"auto"`: Ori asks [model-chooser](https://github.com/festeraeb/model-chooser) (`--chooser-url`) for the best free model for the run's `kinds` (e.g. `["code", "tools"]`), runs on that lane, and reports back whether the run answered. At most `--max-runs` (default 2) run at once.
 
 ## Configuration
 
@@ -127,6 +127,9 @@ Everything that describes your machine is read at run time; nothing about one pa
 | `--skills-dir` / `ORI_SKILLS_DIR` | `~/.config/ori/skills` | `<name>.md` notes a room can ask for |
 | `--runs-dir` / `ORI_RUNS_DIR` | `~/.local/share/ori/runs` | One JSON transcript per agent run |
 | `--nim-url` / `ORI_NIM_URL` | `http://127.0.0.1:9135` | OpenAI-compatible NIM endpoints, comma-separated, at most 5; Ori sends no API key, so point them at local proxies that add yours |
+| `--cline-url` / `ORI_CLINE_URL` | `https://api.cline.bot/api` | Cline's API for upstream `cline` |
+| `--openrouter-url` / `ORI_OPENROUTER_URL` | `https://openrouter.ai/api` | OpenRouter's API for upstream `openrouter` |
+| `--chooser-url` / `ORI_CHOOSER_URL` | (off) | model-chooser for upstream `auto` |
 | `--max-agents` / `ORI_MAX_AGENTS` | `3` | Subagents at once across the harness for `spawn_subagents` (1 to 5); also the per-run `ask_helper` limit |
 | `ORI_HOST_NAME` | the system host name | How agent prompts name this machine |
 | `ORI_SELF_HOSTS` | (none) | Extra names and addresses of this machine, comma-separated. Agents may not ssh to them (or to localhost / the host name), since that would leave the no-root sandbox |
