@@ -48,7 +48,7 @@ Add this to your `claude_desktop_config.json` or MCP settings:
 3. **Full Model Context Protocol (MCP) Surface Layer**:
    - HTTP endpoint: `POST /mcp` (JSON-RPC 2.0)
    - STDIO mode: `--mcp-stdio`
-   - Built-in tools: `shell_exec`, `file_read`, `file_write`, `hardware_status`, `spawn_subagent`, `scorecard_eval`
+   - Built-in tools: `shell_exec`, `file_read`, `file_write`, `hardware_status`, `spawn_subagent`, `spawn_subagents`, `scorecard_eval`
 4. **Subagent Orchestration**:
    - Delegate subtasks asynchronously without polluting the parent session's context window.
 5. **Zero External Dependencies**:
@@ -115,7 +115,7 @@ The agent policy is enforced by Ori itself, not by an OS sandbox: `bwrap` cannot
 
 One unattended turn for a Buzz room resident, started by a separate waker script that watches the Buzz board (not part of this repo). The model answers with one JSON object per turn (`{"tool": …, "args": …}` or `{"final": …, "kind": …}`), so any chat model works without native tool calling. Tools: allowlisted shell, `read_file`, board messages and tasks, `create_task`, `react`, up to 2 extra posts, up to 3 small-model helper calls. The final answer is posted to the room as a reply to the message that woke it, signed with the agent, model, step count and run id; the full transcript is written to `--runs-dir` (default `~/.local/share/ori/runs`).
 
-Upstreams: `"lemonade"` (default, `--lemonade-url`, local Lemonade on :13305) or `"gateway"` (`--upstream`, the warp gateway on :8126, which streams SSE and may hand a request to a hosted model when a seat is down). At most `--max-runs` (default 2) run at once.
+Upstreams: `"lemonade"` (default, `--lemonade-url`, local Lemonade on :13305) or `"gateway"` (`--upstream`, the warp gateway on :8126, which streams SSE and may hand a request to a hosted model when a seat is down), or `"nim"` (the `--nim-url` pool; each step of a run goes to the next endpoint in turn). At most `--max-runs` (default 2) run at once.
 
 ## Configuration
 
@@ -126,7 +126,8 @@ Everything that describes your machine is read at run time; nothing about one pa
 | `--token-file` / `ORI_TOKEN_FILE` | `~/.config/ori/tokens.json` | Bearer tokens for `/mcp` and `/agent/*` |
 | `--skills-dir` / `ORI_SKILLS_DIR` | `~/.config/ori/skills` | `<name>.md` notes a room can ask for |
 | `--runs-dir` / `ORI_RUNS_DIR` | `~/.local/share/ori/runs` | One JSON transcript per agent run |
-| `--nim-url` / `ORI_NIM_URL` | `http://127.0.0.1:9135` | An OpenAI-compatible NIM endpoint; Ori sends no API key, so point it at a local proxy that adds yours |
+| `--nim-url` / `ORI_NIM_URL` | `http://127.0.0.1:9135` | OpenAI-compatible NIM endpoints, comma-separated, at most 5; Ori sends no API key, so point them at local proxies that add yours |
+| `--max-agents` / `ORI_MAX_AGENTS` | `3` | Subagents at once across the harness for `spawn_subagents` (1 to 5); also the per-run `ask_helper` limit |
 | `ORI_HOST_NAME` | the system host name | How agent prompts name this machine |
 | `ORI_SELF_HOSTS` | (none) | Extra names and addresses of this machine, comma-separated. Agents may not ssh to them (or to localhost / the host name), since that would leave the no-root sandbox |
 | `ORI_WORK_DIR` | `~/ori-work` | Where action agents make git worktrees and run commands |

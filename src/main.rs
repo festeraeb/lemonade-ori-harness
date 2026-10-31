@@ -56,8 +56,12 @@ struct Args {
     skills_dir: String,
 
     #[arg(long, default_value = "http://127.0.0.1:9135", env = "ORI_NIM_URL",
-        help = "OpenAI-compatible NVIDIA NIM endpoint (or a local proxy that adds the API key) for agent runs with upstream \"nim\"")]
+        help = "OpenAI-compatible NVIDIA NIM endpoints (or local proxies that add the API key), comma-separated, at most 5; upstream \"nim\" and spawn_subagents use them in turn")]
     nim_url: String,
+
+    #[arg(long, default_value_t = 3, env = "ORI_MAX_AGENTS",
+        help = "Subagents at once across the harness (ask_helper per run, spawn_subagents); capped at 5")]
+    max_agents: usize,
 
     #[arg(long, default_value = "", env = "ORI_ACTION_MODELS",
         help = "Comma-separated models allowed the action tier besides NIM models and models over 2B")]
@@ -109,6 +113,7 @@ struct AppState {
     hardware: hardware::HardwareProfile,
     client: reqwest::Client,
     runs: Arc<tokio::sync::Semaphore>,
+    agents: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -124,14 +129,26 @@ impl AppState {
         agent::Config {
             lemonade: self.args.lemonade_url.clone(),
             gateway: self.args.upstream.clone(),
-            nim: self.args.nim_url.clone(),
+            nim_urls: nim_urls(&self.args.nim_url),
             buzz: self.args.buzz_url.clone(),
             skills_dir: site::expand(&self.args.skills_dir),
             runs_dir: site::expand(&self.args.runs_dir),
             default_model: self.args.agent_model.clone(),
             action_models: self.args.action_models.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            max_agents: max_agents(self.args.max_agents),
+            agents_sem: self.agents.clone(),
         }
     }
+}
+
+/// The NIM pool from `--nim-url`: comma-separated, blanks dropped, at most 5.
+fn nim_urls(arg: &str) -> Vec<String> {
+    arg.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(5).collect()
+}
+
+/// `--max-agents`, kept between 1 and 5.
+fn max_agents(n: usize) -> usize {
+    n.clamp(1, 5)
 }
 
 #[tokio::main]
@@ -156,7 +173,14 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. If --mcp-stdio is given, run as standard MCP STDIO server
     if args.mcp_stdio {
-        return run_stdio_mcp(&args.upstream, &args.buzz_url).await;
+        let env = mcp::HarnessEnv {
+            gateway: args.upstream.clone(),
+            nim_urls: nim_urls(&args.nim_url),
+            buzz: args.buzz_url.clone(),
+            max_agents: max_agents(args.max_agents),
+            agents_sem: Arc::new(tokio::sync::Semaphore::new(max_agents(args.max_agents))),
+        };
+        return run_stdio_mcp(&env).await;
     }
 
     // 3. Normal Daemon Mode: Probe hardware and launch HTTP / MCP server
@@ -176,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         hardware: hw,
         client: reqwest::Client::new(),
         runs: Arc::new(tokio::sync::Semaphore::new(args.max_runs.max(1))),
+        agents: Arc::new(tokio::sync::Semaphore::new(max_agents(args.max_agents))),
     });
     if auth::Tokens::load(&site::expand(&args.token_file)).is_none() {
         warn!("no tokens in {}: /mcp and /agent/* will refuse every request", args.token_file);
@@ -252,14 +277,7 @@ async fn handle_mcp(
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    let resp = mcp::handle_json_rpc(
-        rpc_req,
-        &state.args.upstream,
-        &state.args.buzz_url,
-        &state.client,
-        tier,
-    )
-    .await;
+    let resp = mcp::handle_json_rpc(rpc_req, &state.agent_config().harness_env(), &state.client, tier).await;
     Json(resp).into_response()
 }
 
@@ -518,7 +536,7 @@ async fn handle_chat_completions(
     }
 }
 
-async fn run_stdio_mcp(upstream_url: &str, buzz_url: &str) -> anyhow::Result<()> {
+async fn run_stdio_mcp(env: &mcp::HarnessEnv) -> anyhow::Result<()> {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
     let client = reqwest::Client::new();
@@ -529,10 +547,23 @@ async fn run_stdio_mcp(upstream_url: &str, buzz_url: &str) -> anyhow::Result<()>
         }
         if let Ok(rpc_req) = serde_json::from_str::<mcp::JsonRpcRequest>(&line) {
             // stdio: the person who started this process already has their own shell.
-            let resp = mcp::handle_json_rpc(rpc_req, upstream_url, buzz_url, &client, policy::Tier::Operator).await;
+            let resp = mcp::handle_json_rpc(rpc_req, env, &client, policy::Tier::Operator).await;
             println!("{}", serde_json::to_string(&resp)?);
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nim_pool_and_agent_cap() {
+        assert_eq!(nim_urls(" http://a , ,http://b"), vec!["http://a", "http://b"]);
+        assert_eq!(nim_urls("1,2,3,4,5,6,7").len(), 5);
+        assert!(nim_urls("").is_empty());
+        assert_eq!(max_agents(0), 1);
+        assert_eq!(max_agents(9), 5);
+    }
+}

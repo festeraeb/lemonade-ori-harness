@@ -1,7 +1,11 @@
 use crate::policy::{self, Tier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Most subtasks one spawn_subagents call may fan out.
+const MAX_SWARM_TASKS: usize = 20;
 
 /// Tools a research-tier caller never gets.
 const OPERATOR_ONLY: &[&str] = &["file_write", "scorecard_eval"];
@@ -108,6 +112,18 @@ fn all_tools() -> Value {
                         "model": { "type": "string", "description": "Target model alias or auto" }
                     },
                     "required": ["task"]
+                }
+            },
+            {
+                "name": "spawn_subagents",
+                "description": "Fan out up to 20 subtasks as one-shot chat calls, at most max-agents (hard cap 5) at once across the whole harness. With a NIM pool configured, subagent i goes to NIM endpoint i mod pool size; otherwise to the gateway.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tasks": { "type": "array", "items": { "type": "object", "description": "Each: task (string, required), role, model, upstream URL (optional)" } },
+                        "model": { "type": "string", "description": "Model for tasks that name none. Required when the NIM pool is used; without a pool the gateway's \"auto\" is used" }
+                    },
+                    "required": ["tasks"]
                 }
             },
             {
@@ -225,14 +241,28 @@ fn all_tools() -> Value {
     })
 }
 
+/// Environment handed to the MCP surface so tools can reach the NIM pool and the swarm's
+/// concurrency semaphore without hard-coded addresses.
+#[derive(Clone)]
+pub struct HarnessEnv {
+    pub gateway: String,
+    pub nim_urls: Vec<String>,
+    pub buzz: String,
+    pub max_agents: usize,
+    pub agents_sem: Arc<tokio::sync::Semaphore>,
+}
+
 pub async fn call_tool(
     name: &str,
     args: &Value,
-    upstream_url: &str,
-    buzz_url: &str,
+    env: &HarnessEnv,
     client: &reqwest::Client,
     tier: Tier,
 ) -> Result<Value, String> {
+    // Gateway as the upstream chat API and the Buzz board URL, as before; the swarm tool
+    // reads the rest from `env`.
+    let upstream_url = &env.gateway;
+    let buzz_url = &env.buzz;
     if tier == Tier::Agent && OPERATOR_ONLY.contains(&name) {
         return Err(format!("{name} is operator-only; propose the change with buzz_create_task"));
     }
@@ -350,6 +380,44 @@ pub async fn call_tool(
                     { "type": "text", "text": res }
                 ]
             }))
+        }
+        "spawn_subagents" => {
+            let tasks: Vec<crate::subagent::SubagentTask> =
+                serde_json::from_value(args.get("tasks").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| format!("tasks: {e}"))?;
+            if tasks.is_empty() || tasks.len() > MAX_SWARM_TASKS {
+                return Err(format!("tasks: give 1 to {MAX_SWARM_TASKS}"));
+            }
+            let fallback_model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let fallback_model = if !fallback_model.is_empty() {
+                fallback_model
+            } else if env.nim_urls.is_empty() {
+                "auto"
+            } else if tasks.iter().all(|t| !t.model.is_empty() || !t.upstream.is_empty()) {
+                ""
+            } else {
+                return Err("model: required when tasks go to the NIM pool (NIM has no \"auto\")".into());
+            };
+            let results = crate::subagent::dispatch_subagents(
+                client, &tasks, &env.nim_urls, upstream_url, fallback_model, env.agents_sem.clone(),
+            )
+            .await;
+            let failed = results.iter().filter(|r| r.is_err()).count();
+            let body: Vec<String> = results
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| match r {
+                    Ok(t) => format!("#{i} ok\n{t}"),
+                    Err(e) => format!("#{i} error: {e}"),
+                })
+                .collect();
+            Ok(text(format!(
+                "{} subagents, {} failed (max {} at once)\n\n{}",
+                tasks.len(),
+                failed,
+                env.max_agents.min(5),
+                body.join("\n\n")
+            )))
         }
         "scorecard_eval" => {
             let iterations = args.get("iterations").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
@@ -562,8 +630,7 @@ pub async fn call_tool(
 
 pub async fn handle_json_rpc(
     req: JsonRpcRequest,
-    upstream_url: &str,
-    buzz_url: &str,
+    env: &HarnessEnv,
     client: &reqwest::Client,
     tier: Tier,
 ) -> JsonRpcResponse {
@@ -580,7 +647,7 @@ pub async fn handle_json_rpc(
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").unwrap_or(&Value::Null);
 
-            match call_tool(name, args, upstream_url, buzz_url, client, tier).await {
+            match call_tool(name, args, env, client, tier).await {
                 Ok(res) => JsonRpcResponse {
                     jsonrpc: "2.0".into(),
                     id,
