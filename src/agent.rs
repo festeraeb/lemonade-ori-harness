@@ -356,9 +356,19 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
         (None, Some((_, m))) => m.clone(),
         (None, None) => cfg.default_model.clone(),
     };
-    // Ori decides the tier from the model, not the caller: a small model asked for action gets research.
+    // Ori decides the tier from the model that WILL ACTUALLY SERVE, not from the caller's label.
+    // A llama-server ignores the request's `model` field, so the label can be fiction; granting
+    // privilege from it let a caller choose its own tier by naming anything with a "/" in it.
+    let (served, served_note) = match &chosen {
+        // "auto" already fixed a concrete endpoint and model, so there is nothing to resolve.
+        Some(_) => (model.clone(), None),
+        None => {
+            let ep = resolve_upstream(&upstream_key, cfg, 0)?;
+            served_model(client, &ep, &model).await
+        }
+    };
     let wants_action = req.tier.as_deref() == Some("action");
-    let tier = if wants_action && crate::policy::action_allowed(&model, &cfg.action_models) { Tier::Action } else { Tier::Agent };
+    let tier = if wants_action && crate::policy::action_allowed(&served, &cfg.action_models) { Tier::Action } else { Tier::Agent };
     let tier_name = if tier == Tier::Action { "action" } else { "research" };
     let max_steps = if tier == Tier::Action {
         req.max_steps.unwrap_or(12).clamp(1, MAX_ACTION_STEPS)
@@ -379,8 +389,12 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
     ];
     let env = cfg.harness_env();
     let mut trace: Vec<Value> = Vec::new();
+    // Record a label/served mismatch where someone reading the run will see it.
+    if let Some(note) = served_note {
+        trace.push(json!({"note": note}));
+    }
     if wants_action && tier != Tier::Action {
-        trace.push(json!({"note": format!("action tier refused for {model} (needs a NIM model or more than 2B parameters); running as research")}));
+        trace.push(json!({"note": format!("action tier refused for {served} (needs a NIM model or more than 2B parameters); running as research")}));
     }
     let (mut extra_posts, mut helpers, mut bad_replies) = (0usize, 0usize, 0u8);
     let mut answer: Option<(String, String, bool)> = None;
@@ -448,7 +462,7 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
             }
             "board_messages" => mcp::call_tool("buzz_get_messages", &args, &env, client, tier).await,
             "board_tasks" => mcp::call_tool("buzz_get_tasks", &args, &env, client, tier).await,
-            "create_task" if !crate::policy::action_allowed(&model, &cfg.action_models) => {
+            "create_task" if !crate::policy::action_allowed(&served, &cfg.action_models) => {
                 Err("models of 2B parameters or less cannot file tasks; put the suggestion in your final answer".into())
             }
             "create_task" => {
@@ -498,7 +512,7 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
     let mut posted_id: Option<String> = None;
     if let Some((text, kind, true)) = answer.as_ref().map(|(t, k, p)| (t.clone(), k.clone(), *p)) {
         if req.post {
-            let body = format!("{text}\n\n— {} ({model}, {tier_name}, {} steps, run {run_id})", req.agent, trace.len());
+            let body = format!("{text}\n\n— {} ({served}, {tier_name}, {} steps, run {run_id})", req.agent, trace.len());
             let payload = json!({
                 "sender": req.agent, "body": body, "channel": req.room, "kind": kind,
                 "reply_to": req.trigger_id,
@@ -520,7 +534,7 @@ pub async fn run(cfg: &Config, client: &reqwest::Client, req: RunRequest) -> Res
 
     let record = json!({
         "run_id": run_id, "agent": req.agent, "room": req.room, "goal": req.goal, "trigger_id": req.trigger_id,
-        "model": model, "upstream": req.upstream.as_deref().unwrap_or("lemonade"), "tier": tier_name,
+        "model": served, "requested_model": model, "upstream": req.upstream.as_deref().unwrap_or("lemonade"), "tier": tier_name,
         "status": if answer.is_some() { "answered" } else if llm_error.is_some() { "llm_error" } else { "no_final" },
         "final": answer.as_ref().map(|a| a.0.clone()), "kind": answer.as_ref().map(|a| a.1.clone()),
         "posted_id": posted_id, "steps": trace,
@@ -595,5 +609,140 @@ mod upstream_tests {
         assert_eq!(resolve_upstream("lemonade", &c, 0).unwrap().key().unwrap(), None);
         let missing = Endpoint { url: "x".into(), key_env: "ORI_TEST_KEY_THAT_IS_NOT_SET".into() };
         assert!(missing.key().is_err());
+    }
+}
+
+/// What the upstream will ACTUALLY serve for `requested`, which is not always `requested`.
+///
+/// A plain `llama-server` ignores the `model` field in the request body and serves whatever it
+/// was started with, so a caller's label can be pure fiction. That mattered: `buzz_waker` asked
+/// for `Qwen3-VL-4B-Instruct-GGUF` on upstream "lemonade", `ORI_LEMONADE_URL` pointed at a
+/// llama-server holding `strand-rust-coder-14b`, and every run record for months named a model
+/// that never ran. Worse, the action tier was granted from that label, so the privilege decision
+/// was made on a string the caller chose.
+///
+/// Resolution, from the upstream's own `/v1/models`:
+/// * `requested` is advertised -> it will be honoured, so return it.
+/// * exactly one model advertised -> that one serves, whatever was asked for.
+/// * several advertised but `requested` is not among them -> return `requested` unchanged and
+///   let the call fail honestly; guessing another model would hide the caller's mistake.
+/// * the list cannot be read -> return `requested`; a probe failure must not change privilege.
+///
+/// Best effort by design: this decides a tier, so it fails toward the requested label rather
+/// than toward more privilege.
+pub async fn served_model(
+    client: &reqwest::Client,
+    ep: &Endpoint,
+    requested: &str,
+) -> (String, Option<String>) {
+    let key = match ep.key() {
+        Ok(k) => k,
+        Err(_) => return (requested.to_string(), None),
+    };
+    let url = format!("{}/v1/models", ep.url.trim_end_matches('/').trim_end_matches("/v1"));
+    let mut rq = client.get(&url).timeout(std::time::Duration::from_secs(8));
+    if let Some(k) = key.as_deref() {
+        rq = rq.bearer_auth(k);
+    }
+    let Ok(resp) = rq.send().await else { return (requested.to_string(), None) };
+    let Ok(v) = resp.json::<Value>().await else { return (requested.to_string(), None) };
+    let ids: Vec<String> = v["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if ids.iter().any(|i| i == requested) {
+        return (requested.to_string(), None);
+    }
+    if ids.len() == 1 {
+        let served = ids[0].clone();
+        let note = format!(
+            "upstream {} serves only {served:?} and ignores the requested model {requested:?}; \
+             tier and record use {served:?}",
+            ep.url
+        );
+        return (served, Some(note));
+    }
+    (requested.to_string(), None)
+}
+
+#[cfg(test)]
+mod served_model_tests {
+    use super::*;
+    use axum::{routing::get, Router};
+
+    async fn serve(app: Router) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn models(ids: &'static [&'static str]) -> Router {
+        Router::new().route(
+            "/v1/models",
+            get(move || async move {
+                axum::Json(json!({"data": ids.iter().map(|i| json!({"id": i})).collect::<Vec<_>>()}))
+            }),
+        )
+    }
+
+    /// A single-model llama-server ignores the request's `model`, so the served id wins and the
+    /// mismatch is reported. This is the real case: Ori asked for a 4B and got a 14B coder.
+    #[tokio::test]
+    async fn one_model_upstream_overrides_the_requested_label() {
+        let base = serve(models(&["strand-rust-coder-14b"])).await;
+        let ep = Endpoint::open(&base);
+        let (served, note) = served_model(&reqwest::Client::new(), &ep, "Qwen3-VL-4B-Instruct-GGUF").await;
+        assert_eq!(served, "strand-rust-coder-14b");
+        let note = note.expect("a mismatch must be reported");
+        assert!(note.contains("strand-rust-coder-14b"), "{note}");
+        assert!(note.contains("Qwen3-VL-4B-Instruct-GGUF"), "{note}");
+    }
+
+    /// The privilege hole this closes. `action_allowed` grants the action tier to any id with a
+    /// "/" in it, so a caller could name `vendor/anything` and get a shell. Judged on what the
+    /// upstream actually serves, a sub-2B local model cannot buy that tier.
+    ///
+    /// Note the live ori-ops case did NOT trip this: it asked for a 4B and got a 14B, and both
+    /// clear the 2B bar, so only the telemetry was wrong there. The hole is still real.
+    #[tokio::test]
+    async fn a_fictional_vendor_label_cannot_buy_the_action_tier() {
+        let base = serve(models(&["Qwen3-0.6B-GGUF"])).await;
+        let ep = Endpoint::open(&base);
+        let (served, note) = served_model(&reqwest::Client::new(), &ep, "vendor/enormous-70b").await;
+        assert_eq!(served, "Qwen3-0.6B-GGUF");
+        assert!(note.is_some(), "the mismatch must be recorded");
+        assert!(crate::policy::action_allowed("vendor/enormous-70b", &[]), "the label alone would pass");
+        assert!(!crate::policy::action_allowed(&served, &[]), "the served 0.6B must not");
+    }
+
+    /// A hub that advertises the requested model will honour it, so keep the request.
+    #[tokio::test]
+    async fn a_hub_that_advertises_the_model_keeps_it() {
+        let base = serve(models(&["Hermes-3-Llama-3.1-8B-Q5_K_M", "Gemma-4-26B-MoE"])).await;
+        let ep = Endpoint::open(&base);
+        let (served, note) = served_model(&reqwest::Client::new(), &ep, "Gemma-4-26B-MoE").await;
+        assert_eq!(served, "Gemma-4-26B-MoE");
+        assert!(note.is_none());
+    }
+
+    /// Several models and none of them the requested one: do not guess. Returning the request
+    /// lets the call fail honestly instead of silently running something else.
+    #[tokio::test]
+    async fn a_hub_without_the_requested_model_does_not_guess() {
+        let base = serve(models(&["a", "b"])).await;
+        let ep = Endpoint::open(&base);
+        let (served, note) = served_model(&reqwest::Client::new(), &ep, "c").await;
+        assert_eq!(served, "c");
+        assert!(note.is_none());
+    }
+
+    /// A probe failure must not change privilege: fall back to the requested label, never to more.
+    #[tokio::test]
+    async fn an_unreachable_upstream_falls_back_to_the_request() {
+        let ep = Endpoint::open("http://127.0.0.1:1");
+        let (served, note) = served_model(&reqwest::Client::new(), &ep, "m1").await;
+        assert_eq!(served, "m1");
+        assert!(note.is_none());
     }
 }
